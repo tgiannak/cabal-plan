@@ -107,8 +107,7 @@ getLicenseFiles storeDir compilerId (UnitId uidt) fns = do
 -}
 
 data LicenseReportInfo = LicenseReportInfo
-    { liName :: T.Text
-    , liVersion :: Ver
+    { liPkgId :: PkgId
     , liPackageUrl :: T.Text
     , liLicenseInfo :: Maybe LicenseInfo
     , liReverseDependencies :: [PkgName]
@@ -118,7 +117,7 @@ data LicenseReportInfo = LicenseReportInfo
 data LicenseInfo = LicenseInfo
     { liLicenseId :: License
     , liLicenseFiles :: [SymbolicPath PackageDir LicenseFile]
-    , liDescription :: String
+    , liDescription :: T.Text
     }
 
 data DependencyLicenses = DependencyLicenses
@@ -127,19 +126,19 @@ data DependencyLicenses = DependencyLicenses
     }
 
 -- Relies on lazy Map to not parse all packages.
-getIndexPackageDescriptions :: IO (Map PkgId GenericPackageDescription)
-getIndexPackageDescriptions = do
-    -- find and read ~/.cabal/config
-    cfg <- readConfig
+getPlanIndexPackageDescriptions :: Config Identity -> PlanJson -> IO (Map PkgId GenericPackageDescription)
+getPlanIndexPackageDescriptions cfg plan = do
     indexPath <- maybe (fail "No hackage.haskell.org repository") return $ cfgRepoIndex cfg hackageHaskellOrg
-    packageTexts <- Map.map BSL.toStrict . Map.fromList <$> readHackageIndex indexPath
+    let pidsOfInterest = Set.fromList (map uPId (Map.elems $ pjUnits plan))
+    indexDb <- Map.fromList . filter (flip Set.member pidsOfInterest . fst) <$> readHackageIndex indexPath
+    let packageTexts = Map.map BSL.toStrict indexDb
     forM packageTexts $ maybe (fail "parseGenericPackageDescriptionMaybe") pure . parseGenericPackageDescriptionMaybe
 
 genericPackageDescriptionLicenseInfo :: GenericPackageDescription -> LicenseInfo
 genericPackageDescriptionLicenseInfo gpd = LicenseInfo
     { liLicenseId = lic
     , liLicenseFiles = lfs
-    , liDescription = desc
+    , liDescription = T.pack desc
     }
   where
     desc = escapeDesc
@@ -179,7 +178,7 @@ getLicenses pkgDescDb plan uid0 = DependencyLicenses direct indirect
     getLicenseReportInfo :: UnitId -> LicenseReportInfo
     getLicenseReportInfo uid =
       let Just u = Map.lookup uid (pjUnits plan)
-          PkgId (PkgName pn) pv = uPId u
+          PkgId (PkgName pn) _ = uPId u
           url = case pn of
               "rts" -> "https://gitlab.haskell.org/ghc/ghc/"
               _ -> "http://hackage.haskell.org/package/" <> dispPkgId (uPId u)
@@ -190,8 +189,7 @@ getLicenses pkgDescDb plan uid0 = DependencyLicenses direct indirect
                                 ]
           revDepIds = [ z | PkgId z _ <- Set.toList usedBy,  z /= pn0 ]
       in LicenseReportInfo
-          { liName = pn
-          , liVersion = pv
+          { liPkgId = uPId u
           , liPackageUrl = url
           , liLicenseInfo = getLicenseInfo pkgDescDb (uPId u)
           , liReverseDependencies = revDepIds
@@ -200,129 +198,102 @@ getLicenses pkgDescDb plan uid0 = DependencyLicenses direct indirect
     direct = map getLicenseReportInfo $ Set.toList directDeps
     indirect = map getLicenseReportInfo $ Set.toList indirectDeps
 
+showLicenseReportTableRow :: Maybe String -> LicenseReportInfo -> T.Text
+showLicenseReportTableRow mlicdir lic = mconcat
+    [ if isB then "| **`" else "| `", pn, if isB then "`** | [`" else "` | [`", dispVer pv, "`](", url , ")", " | "
+    , licenseEntry , " | ", descEntry, " | "
+    , if pn `elem` baseLibs then "*(core library)*"
+        else T.intercalate ", " [ T.singleton '`' <> name <> "`" | PkgName name <- usedBy ], " |"
+    ]
+  where
+    usedBy = liReverseDependencies lic
+    isB = liUnitType lic == UnitTypeBuiltin
+    PkgId (PkgName pn) pv = liPkgId lic
+    url = liPackageUrl lic
+    -- special core libs whose reverse deps are too noisy
+    baseLibs = ["base", "ghc-prim", "integer-gmp", "integer-simple", "rts"]
+    licenseEntry = case liLicenseInfo lic of
+        Nothing -> " *MISSING* "
+        Just licInfo -> liDescription licInfo
+    descEntry = case liLicenseInfo lic of
+        Nothing -> " *MISSING* "
+        Just licInfo ->
+            let licurl = case liLicenseFiles licInfo of
+                    [] -> liPackageUrl lic
+                    (l:_) | Just licdir <- mlicdir, liUnitType lic == UnitTypeGlobal ->
+                            T.pack (licdir </> T.unpack (dispPkgId (liPkgId lic)) </> takeFileName (getSymbolicPath l))
+                          | otherwise                                                ->
+                            liPackageUrl lic <> "/src/" <> T.pack (getSymbolicPath l)
+            in
+            mconcat [T.pack (prettyShow (liLicenseId licInfo)), "`](", licurl , ")"]
+
+showLicenseReportInfoWarning :: LicenseReportInfo -> Maybe T.Text
+showLicenseReportInfoWarning LicenseReportInfo{..} = case liLicenseInfo of
+    Nothing -> Just $ "WARNING: couldn't find metadata for " <> dispPkgId liPkgId
+    Just _ -> Nothing
+
+-- copyLicenseFiles :: FilePath -> PlanJson -> UnitId -> CompName -> IO ()
+-- copyLicenseFiles mlicdir plan uid cn0 = _
+-- runLicenseReport :: Maybe FilePath -> PlanJson -> UnitId -> CompName -> IO ()
+-- runLicenseReport mlicdir plan uid0 cn0 = do
+--     cfg <- readConfig :: _
+--     indexPkgDescDb <- getPlanIndexPackageDescriptions cfg plan
+--     let storeDir = runIdentity (cfgStoreDir cfg)
+--     let DependencyLicenses directDeps indirectDeps = getLicenses indexPkgDescDb plan uid0
+
 -- TODO: emit report to Text or Text builder
 generateLicenseReport :: Maybe FilePath -> PlanJson -> UnitId -> CompName -> IO ()
 generateLicenseReport mlicdir plan uid0 cn0 = do
     -- find and read ~/.cabal/config
     cfg <- readConfig
-    indexPath <- maybe (fail "No hackage.haskell.org repository") return $ cfgRepoIndex cfg hackageHaskellOrg
+    indexPkgDescDb <- getPlanIndexPackageDescriptions cfg plan
     let storeDir = runIdentity (cfgStoreDir cfg)
+    let DependencyLicenses directDeps indirectDeps = getLicenses indexPkgDescDb plan uid0
+    -- the component of interest
+    let Just root@Unit { uPId = PkgId pn0 _ } = Map.lookup uid0 (pjUnits plan)
 
-    let pidsOfInterest = Set.fromList (map uPId (Map.elems $ pjUnits plan))
+    let printInfo :: LicenseReportInfo -> IO ()
+        printInfo licReportInfo =
+            let (PkgId (PkgName pn) _) = (liPkgId licReportInfo)
+            in
+                unless ("rts" == pn ) $ do
+                    mapM_ (T.hPutStrLn stderr) (showLicenseReportInfoWarning licReportInfo)
+                    T.putStrLn (showLicenseReportTableRow mlicdir licReportInfo)
 
-    indexDb <- Map.fromList . filter (flip Set.member pidsOfInterest . fst) <$> readHackageIndex indexPath
+              -- -- print (pn, pv, prettyShow lic, cr, lfs, [ j | PkgId (PkgName j) _ <- Set.toList usedBy ])
+    -- let copyLicenseFiles :: FilePath -> LicenseInfo -> IO ()
+    --     copyLicensefiles licdir licenseInfo = _
+              -- forM_ mlicdir $ \licdir -> do
 
-    let -- generally, units belonging to the same package as 'root'
-        rootPkgUnits = [ u | u@(Unit { uPId = PkgId pn' _ }) <- Map.elems (pjUnits plan), pn' == pn0 ]
-        rootPkgUnitIds = Set.fromList (map uId rootPkgUnits)
+              --   case liUnitType licReportInfo of
+              --     UnitTypeGlobal -> do
+              --       let lfs' = nub (map (takeFileName . getSymbolicPath) (liLicenseFiles licReportInfo))
 
-        -- the component of interest
-        Just root@Unit { uPId = PkgId pn0 _ } = Map.lookup uid0 (pjUnits plan)
+              --       when (length lfs' /= length lfs) $ do
+              --         T.hPutStrLn stderr ("WARNING: Overlapping license filenames for " <> dispPkgId (uPId u))
 
-        fwdDeps = planJsonIdGraph' plan
-        revDeps = invertMap fwdDeps
+              --       crdat <- getLicenseFiles storeDir (pjCompilerId plan) uid lfs'
 
-    let transUids = transDeps fwdDeps (uId root) Set.\\ rootPkgUnitIds
+              --       forM_ (zip lfs' crdat) $ \(fn,txt) -> do
+              --         let d = licdir </> T.unpack (dispPkgId (uPId u))
+              --         createDirectoryIfMissing True d
+              --         BS.writeFile (d </> fn) txt
 
-        indirectDeps = Set.fromList [ u | u <- Set.toList transUids, Set.null (Map.findWithDefault mempty u revDeps `Set.intersection` rootPkgUnitIds) ]
+              --       -- forM_ crdat $ print
+              --       pure ()
 
-        directDeps = transUids Set.\\ indirectDeps
+              --     -- TODO:
+              --     --   UnitTypeBuiltin
+              --     --   UnitTypeLocal
+              --     --   UnitTypeInplace
 
+              --     UnitTypeBuiltin -> T.hPutStrLn stderr ("WARNING: license files for " <> dispPkgId (uPId u) <> " (global/GHC bundled) not copied")
+              --     UnitTypeLocal   -> T.hPutStrLn stderr ("WARNING: license files for " <> dispPkgId (uPId u) <> " (project-local package) not copied")
+              --     UnitTypeInplace -> T.hPutStrLn stderr ("WARNING: license files for " <> dispPkgId (uPId u) <> " (project-inplace package) not copied")
 
-    let printInfo :: UnitId -> IO ()
-        printInfo uid = do
-          let Just u = Map.lookup uid (pjUnits plan)
+              --   unless (length lfs == Set.size (Set.fromList lfs)) $
+              --     fail ("internal invariant broken for " <> show (uPId u))
 
-              PkgId (PkgName pn) pv = uPId u
-              isB = uType u == UnitTypeBuiltin
-              url = "http://hackage.haskell.org/package/" <> dispPkgId (uPId u)
-
-              -- special core libs whose reverse deps are too noisy
-              baseLibs = ["base", "ghc-prim", "integer-gmp", "integer-simple", "rts"]
-
-              usedBy = Set.fromList [ uPId (Map.findWithDefault undefined unit (pjUnits plan))
-                                    | unit <- Set.toList (Map.findWithDefault mempty uid revDeps)
-                                    , unit `Set.member` (directDeps <> indirectDeps)
-                                    ]
-
-          case BSL.toStrict <$> Map.lookup (uPId u) indexDb of
-            Nothing
-              | PkgId (PkgName "rts") _ <- uPId u -> pure ()
-              | otherwise -> do
-                  -- not found in index -- fail gracefully
-                  T.hPutStrLn stderr ("WARNING: couldn't find metadata for " <> dispPkgId (uPId u))
-
-                  T.putStrLn $ mconcat
-                    [ if isB then "| **`" else "| `", pn, if isB then "`** | [`" else "` | [`", dispVer pv, "`](", url , ")", " | "
-                    , " *MISSING* | *MISSING* | "
-                    , if pn `elem` baseLibs then "*(core library)*"
-                      else T.intercalate ", " [ T.singleton '`' <> (j :: T.Text) <> "`" | PkgId (z@(PkgName j)) _ <- Set.toList usedBy,  z /= pn0], " |"
-                    ]
-
-            Just x -> do
-              gpd <- maybe (fail "parseGenericPackageDescriptionMaybe") pure $
-                     parseGenericPackageDescriptionMaybe x
-
-              let desc = escapeDesc
-#if MIN_VERSION_Cabal(3,2,0)
-                       $ fromShortText
-#endif
-                       $ synopsis $ packageDescription gpd
-                  lic  = license  $ packageDescription gpd
-                  -- cr   = copyright $ packageDescription gpd
-                  lfs  = licenseFiles $ packageDescription gpd
-
-
-              let
-
-                  licurl = case lfs of
-                             [] -> url
-                             (l:_)
-                               | Just licdir <- mlicdir, uType u == UnitTypeGlobal -> T.pack (licdir </> T.unpack (dispPkgId (uPId u)) </> takeFileName (getSymbolicPath l))
-                               | otherwise              -> url <> "/src/" <> T.pack (getSymbolicPath l)
-
-              T.putStrLn $ mconcat
-                [ if isB then "| **`" else "| `", pn, if isB then "`** | [`" else "` | [`", dispVer pv, "`](", url , ")", " | "
-                , "[`", T.pack (prettyShow lic), "`](", licurl , ")", " | "
-                , T.pack desc, " | "
-                , if pn `elem` baseLibs then "*(core library)*"
-                  else T.intercalate ", " [ T.singleton '`' <> (j :: T.Text) <> "`" | PkgId (z@(PkgName j)) _ <- Set.toList usedBy,  z /= pn0], " |"
-                ]
-
-              -- print (pn, pv, prettyShow lic, cr, lfs, [ j | PkgId (PkgName j) _ <- Set.toList usedBy ])
-
-              forM_ mlicdir $ \licdir -> do
-
-                case uType u of
-                  UnitTypeGlobal -> do
-                    let lfs' = nub (map (takeFileName . getSymbolicPath) lfs)
-
-                    when (length lfs' /= length lfs) $ do
-                      T.hPutStrLn stderr ("WARNING: Overlapping license filenames for " <> dispPkgId (uPId u))
-
-                    crdat <- getLicenseFiles storeDir (pjCompilerId plan) uid lfs'
-
-                    forM_ (zip lfs' crdat) $ \(fn,txt) -> do
-                      let d = licdir </> T.unpack (dispPkgId (uPId u))
-                      createDirectoryIfMissing True d
-                      BS.writeFile (d </> fn) txt
-
-                    -- forM_ crdat $ print
-                    pure ()
-
-                  -- TODO:
-                  --   UnitTypeBuiltin
-                  --   UnitTypeLocal
-                  --   UnitTypeInplace
-
-                  UnitTypeBuiltin -> T.hPutStrLn stderr ("WARNING: license files for " <> dispPkgId (uPId u) <> " (global/GHC bundled) not copied")
-                  UnitTypeLocal   -> T.hPutStrLn stderr ("WARNING: license files for " <> dispPkgId (uPId u) <> " (project-local package) not copied")
-                  UnitTypeInplace -> T.hPutStrLn stderr ("WARNING: license files for " <> dispPkgId (uPId u) <> " (project-inplace package) not copied")
-
-                unless (length lfs == Set.size (Set.fromList lfs)) $
-                  fail ("internal invariant broken for " <> show (uPId u))
-
-          pure ()
 
     T.putStrLn "# Dependency License Report"
     T.putStrLn ""
