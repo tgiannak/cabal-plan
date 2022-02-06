@@ -90,25 +90,6 @@ getLicenseFiles storeDir compilerId (UnitId uidt) fns = do
   let docDir = storeDir </> T.unpack (dispPkgId compilerId) </> T.unpack uidt </> "share" </> "doc"
   forM fns $ \fn -> BS.readFile (docDir </> fn)
 
-{- WARNING: the code that follows will make you cry; a safety pig is provided below for your benefit.
-
-                         _
- _._ _..._ .-',     _.._(`))
-'-. `     '  /-._.-'    ',/
-   )         \            '.
-  / _    _    |             \
- |  a    a    /              |
- \   .-.                     ;
-  '-('' ).-'       ,'       ;
-     '-;           |      .'
-        \           \    /
-        | 7  .__  _.-\   \
-        | |  |  ``/  /`  /
-       /,_|  |   /,_/   /
-          /,_/      '`-'
-
--}
-
 data LicenseReportInfo = LicenseReportInfo
     { liUnit :: Unit
     , liPkgUrl :: T.Text
