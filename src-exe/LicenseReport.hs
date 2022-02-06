@@ -6,7 +6,7 @@
 --
 -- Implements @cabal-plan license-report@ functionality
 module LicenseReport
-    ( generateLicenseReport
+    ( runLicenseReport
     ) where
 
 #if defined(MIN_VERSION_Cabal)
@@ -125,6 +125,10 @@ data DependencyLicenses = DependencyLicenses
     , indirectDependencyLicenses :: [LicenseReportInfo]
     }
 
+allDependencyLicenses :: DependencyLicenses -> [LicenseReportInfo]
+allDependencyLicenses DependencyLicenses{..} =
+    directDependencyLicenses <> indirectDependencyLicenses
+
 -- Relies on lazy Map to not parse all packages.
 getPlanIndexPackageDescriptions :: Config Identity -> PlanJson -> IO (Map PkgId GenericPackageDescription)
 getPlanIndexPackageDescriptions cfg plan = do
@@ -198,35 +202,6 @@ getLicenses pkgDescDb plan uid0 = DependencyLicenses direct indirect
     direct = map getLicenseReportInfo $ Set.toList directDeps
     indirect = map getLicenseReportInfo $ Set.toList indirectDeps
 
-showLicenseReportTableRow :: Maybe String -> LicenseReportInfo -> T.Text
-showLicenseReportTableRow mlicdir lic = mconcat
-    [ if isB then "| **`" else "| `", pn, if isB then "`** | [`" else "` | [`", dispVer pv, "`](", url , ")", " | "
-    , licenseEntry , " | ", descEntry, " | "
-    , if pn `elem` baseLibs then "*(core library)*"
-        else T.intercalate ", " [ T.singleton '`' <> name <> "`" | PkgName name <- usedBy ], " |"
-    ]
-  where
-    usedBy = liReverseDependencies lic
-    isB = liUnitType lic == UnitTypeBuiltin
-    PkgId (PkgName pn) pv = liPkgId lic
-    url = liPackageUrl lic
-    -- special core libs whose reverse deps are too noisy
-    baseLibs = ["base", "ghc-prim", "integer-gmp", "integer-simple", "rts"]
-    licenseEntry = case liLicenseInfo lic of
-        Nothing -> " *MISSING* "
-        Just licInfo -> liDescription licInfo
-    descEntry = case liLicenseInfo lic of
-        Nothing -> " *MISSING* "
-        Just licInfo ->
-            let licurl = case liLicenseFiles licInfo of
-                    [] -> liPackageUrl lic
-                    (l:_) | Just licdir <- mlicdir, liUnitType lic == UnitTypeGlobal ->
-                            T.pack (licdir </> T.unpack (dispPkgId (liPkgId lic)) </> takeFileName (getSymbolicPath l))
-                          | otherwise                                                ->
-                            liPackageUrl lic <> "/src/" <> T.pack (getSymbolicPath l)
-            in
-            mconcat [T.pack (prettyShow (liLicenseId licInfo)), "`](", licurl , ")"]
-
 showLicenseReportInfoWarning :: LicenseReportInfo -> Maybe T.Text
 showLicenseReportInfoWarning LicenseReportInfo{..} = case liLicenseInfo of
     Nothing -> Just $ "WARNING: couldn't find metadata for " <> dispPkgId liPkgId
@@ -234,32 +209,6 @@ showLicenseReportInfoWarning LicenseReportInfo{..} = case liLicenseInfo of
 
 -- copyLicenseFiles :: FilePath -> PlanJson -> UnitId -> CompName -> IO ()
 -- copyLicenseFiles mlicdir plan uid cn0 = _
--- runLicenseReport :: Maybe FilePath -> PlanJson -> UnitId -> CompName -> IO ()
--- runLicenseReport mlicdir plan uid0 cn0 = do
---     cfg <- readConfig :: _
---     indexPkgDescDb <- getPlanIndexPackageDescriptions cfg plan
---     let storeDir = runIdentity (cfgStoreDir cfg)
---     let DependencyLicenses directDeps indirectDeps = getLicenses indexPkgDescDb plan uid0
-
--- TODO: emit report to Text or Text builder
-generateLicenseReport :: Maybe FilePath -> PlanJson -> UnitId -> CompName -> IO ()
-generateLicenseReport mlicdir plan uid0 cn0 = do
-    -- find and read ~/.cabal/config
-    cfg <- readConfig
-    indexPkgDescDb <- getPlanIndexPackageDescriptions cfg plan
-    let storeDir = runIdentity (cfgStoreDir cfg)
-    let DependencyLicenses directDeps indirectDeps = getLicenses indexPkgDescDb plan uid0
-    -- the component of interest
-    let Just root@Unit { uPId = PkgId pn0 _ } = Map.lookup uid0 (pjUnits plan)
-
-    let printInfo :: LicenseReportInfo -> IO ()
-        printInfo licReportInfo =
-            let (PkgId (PkgName pn) _) = (liPkgId licReportInfo)
-            in
-                unless ("rts" == pn ) $ do
-                    mapM_ (T.hPutStrLn stderr) (showLicenseReportInfoWarning licReportInfo)
-                    T.putStrLn (showLicenseReportTableRow mlicdir licReportInfo)
-
               -- -- print (pn, pv, prettyShow lic, cr, lfs, [ j | PkgId (PkgName j) _ <- Set.toList usedBy ])
     -- let copyLicenseFiles :: FilePath -> LicenseInfo -> IO ()
     --     copyLicensefiles licdir licenseInfo = _
@@ -295,26 +244,103 @@ generateLicenseReport mlicdir plan uid0 cn0 = do
               --     fail ("internal invariant broken for " <> show (uPId u))
 
 
-    T.putStrLn "# Dependency License Report"
-    T.putStrLn ""
-    T.putStrLn ("Bold-faced **`package-name`**s denote standard libraries bundled with `" <> dispPkgId (pjCompilerId plan) <> "`.")
-    T.putStrLn ""
 
-    T.putStrLn ("## Direct dependencies of `" <> unPkgN pn0 <> ":" <> dispCompNameTarget pn0 cn0 <> "`")
-    T.putStrLn ""
-    T.putStrLn "| Name | Version | [SPDX](https://spdx.org/licenses/) License Id | Description | Also depended upon by |"
-    T.putStrLn "| --- | --- | --- | --- | --- |"
-    forM_ directDeps $ printInfo
-    T.putStrLn ""
+runLicenseReport :: Maybe FilePath -> PlanJson -> UnitId -> CompName -> IO ()
+runLicenseReport mlicdir plan uid0 cn0 = do
+    -- find and read ~/.cabal/config
+    cfg <- readConfig
+    indexPkgDescDb <- getPlanIndexPackageDescriptions cfg plan
+    let storeDir = runIdentity (cfgStoreDir cfg)
+    let compilerId = pjCompilerId plan
+    -- the component of interest
+    let Just root@Unit { uPId = PkgId pn0 _ } = Map.lookup uid0 (pjUnits plan)
 
-    T.putStrLn "## Indirect transitive dependencies"
-    T.putStrLn ""
-    T.putStrLn "| Name | Version | [SPDX](https://spdx.org/licenses/) License Id | Description | Depended upon by |"
-    T.putStrLn "| --- | --- | --- | --- | --- |"
-    forM_ indirectDeps $ printInfo
-    T.putStrLn ""
+    let dependencyLicenses = getLicenses indexPkgDescDb plan uid0
+    forM_ (allDependencyLicenses dependencyLicenses) $ \licReportInfo ->
+        let (PkgId (PkgName pn) _) = (liPkgId licReportInfo)
+        in unless ("rts" == pn ) $ mapM_ (T.hPutStrLn stderr) (showLicenseReportInfoWarning licReportInfo)
 
-    pure ()
+    -- copyLicense smlicdir pn0 cn0 compilerId dependencyLicenses
+    T.putStrLn $ generateCommonmarkLicenseReport mlicdir pn0 cn0 compilerId dependencyLicenses
+
+-- | Creates a Commonmark formatted license report.
+--
+-- Some entries reverse dependencies are omitted from the output because they
+-- are too common to be informative. The rts package is from the output omitted
+-- entirely.
+generateCommonmarkLicenseReport ::
+    -- | If not Nothing, used as base directory for license files for global
+    -- units instead of giving a Hackage URL.
+    Maybe FilePath ->
+    -- | The name of the package the report is for.
+    PkgName ->
+    -- | The name of the component the report is for.
+    CompName ->
+    -- | The ID of the compiler.
+    PkgId ->
+    -- | The dependency license info to include in the report.
+    DependencyLicenses ->
+    T.Text
+generateCommonmarkLicenseReport mlicdir pn0 cn0 compilerId dependencyLicenses =
+    T.unlines $
+        [ "# Dependency License Report"
+        , ""
+        , ("Bold-faced **`package-name`**s denote standard libraries bundled with `" <> dispPkgId compilerId <> "`.")
+        , ""
+        , ("## Direct dependencies of `" <> unPkgN pn0 <> ":" <> dispCompNameTarget pn0 cn0 <> "`")
+        , ""
+        , "| Name | Version | [SPDX](https://spdx.org/licenses/) License Id | Description | Also depended upon by |"
+        , "| --- | --- | --- | --- | --- |"
+        ]
+        <>
+        mapMaybe showInfo directDeps
+        <>
+        [ ""
+        , "## Indirect transitive dependencies"
+        , ""
+        , "| Name | Version | [SPDX](https://spdx.org/licenses/) License Id | Description | Depended upon by |"
+        , "| --- | --- | --- | --- | --- |"
+        ]
+        <>
+        mapMaybe showInfo indirectDeps
+        <>
+        [""]
+  where
+    DependencyLicenses directDeps indirectDeps = dependencyLicenses
+
+    showInfo :: LicenseReportInfo -> Maybe T.Text
+    showInfo licReportInfo =
+        let (PkgId (PkgName pn) _) = (liPkgId licReportInfo)
+        in if ("rts" == pn )
+            then Nothing
+            else Just (showLicenseReportTableRow mlicdir licReportInfo)
+
+    showLicenseReportTableRow :: Maybe String -> LicenseReportInfo -> T.Text
+    showLicenseReportTableRow mlicdir lic = mconcat
+        [ if isB then "| **`" else "| `", pn, if isB then "`** | [`" else "` | [`", dispVer pv, "`](", liPackageUrl lic, ")", " | "
+        , licenseEntry , " | ", descEntry, " | "
+        , if pn `elem` baseLibs then "*(core library)*"
+            else T.intercalate ", " [ T.singleton '`' <> name <> "`" | PkgName name <- liReverseDependencies lic ], " |"
+        ]
+      where
+        isB = liUnitType lic == UnitTypeBuiltin
+        PkgId (PkgName pn) pv = liPkgId lic
+        -- special core libs whose reverse deps are too noisy
+        baseLibs = ["base", "ghc-prim", "integer-gmp", "integer-simple", "rts"]
+        licenseEntry = case liLicenseInfo lic of
+            Nothing -> " *MISSING* "
+            Just licInfo -> liDescription licInfo
+        descEntry = case liLicenseInfo lic of
+            Nothing -> " *MISSING* "
+            Just licInfo ->
+                let licurl = case liLicenseFiles licInfo of
+                        [] -> liPackageUrl lic
+                        (l:_) | Just licdir <- mlicdir, liUnitType lic == UnitTypeGlobal ->
+                                T.pack (licdir </> T.unpack (dispPkgId (liPkgId lic)) </> takeFileName (getSymbolicPath l))
+                            | otherwise                                                ->
+                                liPackageUrl lic <> "/src/" <> T.pack (getSymbolicPath l)
+                in
+                mconcat [T.pack (prettyShow (liLicenseId licInfo)), "`](", licurl , ")"]
 
 escapeDesc :: String -> String
 escapeDesc []          = []
@@ -357,8 +383,8 @@ import           Cabal.Plan
 import           System.Exit
 import           System.IO
 
-generateLicenseReport :: Maybe FilePath -> PlanJson -> UnitId -> CompName -> IO ()
-generateLicenseReport _ _ _ _ = do
+runLicenseReport :: Maybe FilePath -> PlanJson -> UnitId -> CompName -> IO ()
+runLicenseReport _ _ _ _ = do
   hPutStrLn stderr "ERROR: `cabal-plan license-report` sub-command not available! Please recompile/reinstall `cabal-plan` with the `license-report` Cabal flag activated."
   exitFailure
 

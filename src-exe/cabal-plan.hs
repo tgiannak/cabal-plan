@@ -52,7 +52,7 @@ import qualified Topograph                   as TG
 
 import           Cabal.Plan
 import           CText
-import           LicenseReport               (generateLicenseReport)
+import           LicenseReport               (runLicenseReport)
 import           Paths_cabal_plan            (version)
 
 
@@ -1200,7 +1200,7 @@ doLicenseReport mlicdir pat = do
           hPutStrLn stderr ("- " ++ T.unpack pat' ++ "   " ++ show (uid, cn))
         exitFailure
 
-      [(_,uid,cn)] -> generateLicenseReport mlicdir plan uid cn
+      [(_,uid,cn)] -> runLicenseReport mlicdir plan uid cn
 
   where
     findUnit plan = do
