@@ -7,6 +7,7 @@
 -- Implements @cabal-plan license-report@ functionality
 module LicenseReport
     ( runLicenseReport
+    , LicenseReportFormat(..)
     ) where
 
 #if defined(MIN_VERSION_Cabal)
@@ -21,7 +22,7 @@ import           Data.Functor.Identity                  (Identity (..))
 import           Data.Map                               (Map)
 import           Data.List                              (nub)
 import qualified Data.Map                               as Map
-import           Data.Maybe                             (mapMaybe)
+import           Data.Maybe                             (mapMaybe, fromMaybe)
 import           Data.Semigroup
 import           Data.Set                               (Set)
 import qualified Data.Set                               as Set
@@ -45,6 +46,8 @@ import Cabal.Config (readConfig, Config (..), cfgRepoIndex, hackageHaskellOrg)
 #if MIN_VERSION_Cabal(3,2,0)
 import          Distribution.Utils.ShortText            (fromShortText)
 #endif
+
+data LicenseReportFormat = Md | Csv
 
 -- | Read tarball lazily (and possibly decompress)
 readTarEntries :: FilePath -> IO [Tar.Entry]
@@ -108,7 +111,7 @@ getLicenseFiles storeDir compilerId (UnitId uidt) fns = do
 
 data LicenseReportInfo = LicenseReportInfo
     { liUnit :: Unit
-    , liPackageUrl :: T.Text
+    , liPkgUrl :: T.Text
     , liLicenseInfo :: Maybe LicenseInfo
     , liReverseDependencies :: [PkgName]
     }
@@ -121,6 +124,12 @@ liUId = uId . liUnit
 
 liUnitType :: LicenseReportInfo -> UnitType
 liUnitType = uType . liUnit
+
+liPkgName :: LicenseReportInfo -> T.Text
+liPkgName lri = let (PkgId (PkgName pn) _) = liPkgId lri in pn
+
+liPkgVersion :: LicenseReportInfo -> Ver
+liPkgVersion lri = let (PkgId (PkgName _) pv) = liPkgId lri in pv
 
 data LicenseInfo = LicenseInfo
     { liLicenseId :: License
@@ -207,7 +216,7 @@ getLicenses pkgDescDb plan uid0 = DependencyLicenses direct indirect
           revDepIds = [ z | PkgId z _ <- Set.toList usedBy,  z /= pn0 ]
       in LicenseReportInfo
           { liUnit = u
-          , liPackageUrl = url
+          , liPkgUrl = url
           , liLicenseInfo = getLicenseInfo pkgDescDb (uPId u)
           , liReverseDependencies = revDepIds
           }
@@ -313,15 +322,13 @@ generateCommonmarkLicenseReport mlicdir pn0 cn0 compilerId dependencyLicenses =
     DependencyLicenses directDeps indirectDeps = dependencyLicenses
 
     showInfo :: LicenseReportInfo -> Maybe T.Text
-    showInfo licReportInfo =
-        let (PkgId (PkgName pn) _) = (liPkgId licReportInfo)
-        in if ("rts" == pn )
-            then Nothing
-            else Just (showLicenseReportTableRow mlicdir licReportInfo)
+    showInfo licReportInfo = if ("rts" == liPkgName licReportInfo)
+        then Nothing
+        else Just $ showLicenseReportTableRow licReportInfo
 
-    showLicenseReportTableRow :: Maybe String -> LicenseReportInfo -> T.Text
-    showLicenseReportTableRow mlicdir lic = mconcat
-        [ if isB then "| **`" else "| `", pn, if isB then "`** | [`" else "` | [`", dispVer pv, "`](", liPackageUrl lic, ")", " | "
+    showLicenseReportTableRow :: LicenseReportInfo -> T.Text
+    showLicenseReportTableRow lic = mconcat
+        [ if isB then "| **`" else "| `", pn, if isB then "`** | [`" else "` | [`", dispVer pv, "`](", liPkgUrl lic, ")", " | "
         , licenseEntry , " | ", descEntry, " | "
         , if pn `elem` baseLibs then "*(core library)*"
             else T.intercalate ", " [ T.singleton '`' <> name <> "`" | PkgName name <- liReverseDependencies lic ], " |"
@@ -338,23 +345,24 @@ generateCommonmarkLicenseReport mlicdir pn0 cn0 compilerId dependencyLicenses =
             Nothing -> " *MISSING* "
             Just licInfo ->
                 let licurl = case liLicenseFiles licInfo of
-                        [] -> liPackageUrl lic
+                        [] -> liPkgUrl lic
                         (l:_) | Just licdir <- mlicdir, liUnitType lic == UnitTypeGlobal ->
                                 T.pack (licdir </> T.unpack (dispPkgId (liPkgId lic)) </> takeFileName (getSymbolicPath l))
-                            | otherwise                                                ->
-                                liPackageUrl lic <> "/src/" <> T.pack (getSymbolicPath l)
+                              | otherwise ->
+                                liPkgUrl lic <> "/src/" <> T.pack (getSymbolicPath l)
                 in
                 mconcat [T.pack (prettyShow (liLicenseId licInfo)), "`](", licurl , ")"]
 
-runLicenseReport :: Maybe FilePath -> PlanJson -> UnitId -> CompName -> IO ()
-runLicenseReport mlicdir plan uid0 cn0 = do
+runLicenseReport :: Maybe FilePath -> PlanJson -> UnitId -> CompName -> Maybe LicenseReportFormat -> IO ()
+runLicenseReport mlicdir plan uid0 cn0 fmt = do
+    let fmt' = fromMaybe Md fmt
     -- find and read ~/.cabal/config
     cfg <- readConfig
     indexPkgDescDb <- getPlanIndexPackageDescriptions cfg plan
     let storeDir = runIdentity (cfgStoreDir cfg)
     let compilerId = pjCompilerId plan
     -- the component of interest
-    let Just root@Unit { uPId = PkgId pn0 _ } = Map.lookup uid0 (pjUnits plan)
+    let Just Unit { uPId = PkgId pn0 _ } = Map.lookup uid0 (pjUnits plan)
 
     let dependencyLicenses = getLicenses indexPkgDescDb plan uid0
     forM_ (allDependencyLicenses dependencyLicenses) $ \licReportInfo ->
@@ -363,7 +371,30 @@ runLicenseReport mlicdir plan uid0 cn0 = do
 
     forM_ mlicdir $ \licdir ->
         forM_ (allDependencyLicenses dependencyLicenses) $ copyLicenseFiles licdir storeDir compilerId
-    T.putStrLn $ generateCommonmarkLicenseReport mlicdir pn0 cn0 compilerId dependencyLicenses
+    case fmt' of
+        Md -> T.putStrLn $ generateCommonmarkLicenseReport mlicdir pn0 cn0 compilerId dependencyLicenses
+        Csv -> T.putStrLn $ generateCsvLicenseReport (allDependencyLicenses dependencyLicenses)
+
+-- | Creates a license report in CSV format including: the package name,
+-- version, URL, and a list of the licenses.
+--
+-- The CSV format may have a variable number of columns in each row, since all
+-- license file URLs are appended to the end of the row. Unlike the Commonmark
+-- report, this does not use local file paths even if licenses were copied.
+generateCsvLicenseReport :: [LicenseReportInfo] -> T.Text
+generateCsvLicenseReport lris = T.unlines $ mapMaybe generateCsvLicenseLine lris
+  where
+    generateCsvLicenseLine :: LicenseReportInfo -> Maybe T.Text
+    generateCsvLicenseLine lri = case liLicenseInfo lri of
+        Just licInfo -> Just . T.intercalate "," $
+            [ liPkgName lri
+            , dispVer $ liPkgVersion lri
+            , liPkgUrl lri
+            , T.pack . prettyShow $ liLicenseId  licInfo
+            ]
+            <>
+            nub (map (\l -> liPkgUrl lri <> "/src/" <> T.pack (getSymbolicPath l)) . liLicenseFiles $ licInfo)
+        Nothing -> Nothing
 
 escapeDesc :: String -> String
 escapeDesc []          = []
@@ -406,8 +437,10 @@ import           Cabal.Plan
 import           System.Exit
 import           System.IO
 
-runLicenseReport :: Maybe FilePath -> PlanJson -> UnitId -> CompName -> IO ()
-runLicenseReport _ _ _ _ = do
+data LicenseReportFormat = Md | Csv
+
+runLicenseReport :: Maybe FilePath -> PlanJson -> UnitId -> CompName -> Maybe LicenseReportFormat -> IO ()
+runLicenseReport _ _ _ _ _ = do
   hPutStrLn stderr "ERROR: `cabal-plan license-report` sub-command not available! Please recompile/reinstall `cabal-plan` with the `license-report` Cabal flag activated."
   exitFailure
 

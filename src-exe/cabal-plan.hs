@@ -52,7 +52,7 @@ import qualified Topograph                   as TG
 
 import           Cabal.Plan
 import           CText
-import           LicenseReport               (runLicenseReport)
+import           LicenseReport               (runLicenseReport, LicenseReportFormat(..))
 import           Paths_cabal_plan            (version)
 
 
@@ -94,7 +94,7 @@ data Command
     | ListBinsCommand    (Maybe SearchPlanJson) MatchCount [Pattern]
     | DotCommand         (Maybe SearchPlanJson) (Flag DotTred) (Flag DotTredWght) [Highlight] [Pattern] FilePath (Maybe RunDot)
     | TopoCommand        (Maybe SearchPlanJson) (Flag TopoReverse) (Flag ShowFlags)
-    | LicenseReport      (Maybe FilePath) Pattern
+    | LicenseReport      (Maybe FilePath) (Maybe LicenseReportFormat) Pattern
     | DiffCommand        SearchPlanJson SearchPlanJson
 
 data RunDot = PNG | PDF
@@ -308,7 +308,7 @@ main = do
       TopoCommand s rev showFlags -> do
           (_, plan) <- findPlan s
           doTopo optsUseColors optsShowBuiltin optsShowGlobal plan rev showFlags
-      LicenseReport mfp pat -> doLicenseReport mfp pat
+      LicenseReport mfp fmt pat -> doLicenseReport mfp pat fmt
   where
     findPlan search = do
         cwd <- getCurrentDirectory
@@ -409,6 +409,7 @@ main = do
             <**> helper
         , subCommand "license-report" "Generate license report for a component" $ LicenseReport
             <$> optional (strOption $ mconcat [ long "licensedir", metavar "DIR", help "Write per-package license documents to folder" ])
+            <*> optional (option licenseReportFormatReader $ mconcat [ long "format", metavar "FORMAT", help "Select the license report format: md, csv" ])
             <*> patternArgument
                 [ metavar "PATTERN", help "Pattern to match.", completer $ patternCompleter False ]
             <**> helper
@@ -1185,8 +1186,14 @@ doDot showBuiltin showGlobal showSetup showExes plan tred tredWeights highlights
 -- license-report
 -------------------------------------------------------------------------------
 
-doLicenseReport :: Maybe FilePath -> Pattern -> IO ()
-doLicenseReport mlicdir pat = do
+licenseReportFormatReader :: ReadM LicenseReportFormat
+licenseReportFormatReader = eitherReader $ \fmt -> case fmt of
+    "md" -> Right Md
+    "csv" -> Right Csv
+    _ -> Left "Expected one of: md, csv"
+
+doLicenseReport :: Maybe FilePath -> Pattern -> Maybe LicenseReportFormat -> IO ()
+doLicenseReport mlicdir pat fmt = do
     plan <- getCurrentDirectory >>= findAndDecodePlanJson . ProjectRelativeToDir
 
     case findUnit plan of
@@ -1200,7 +1207,7 @@ doLicenseReport mlicdir pat = do
           hPutStrLn stderr ("- " ++ T.unpack pat' ++ "   " ++ show (uid, cn))
         exitFailure
 
-      [(_,uid,cn)] -> runLicenseReport mlicdir plan uid cn
+      [(_,uid,cn)] -> runLicenseReport mlicdir plan uid cn fmt
 
   where
     findUnit plan = do
