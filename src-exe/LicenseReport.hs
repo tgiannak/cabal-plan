@@ -110,11 +110,15 @@ data LicenseReportInfo = LicenseReportInfo
     { liName :: T.Text
     , liVersion :: Ver
     , liPackageUrl :: T.Text
-    , liLicenseId :: Maybe License
-    , liLicenseFiles :: Maybe [SymbolicPath PackageDir LicenseFile]
-    , liDescription :: Maybe String
+    , liLicenseInfo :: Maybe LicenseInfo
     , liReverseDependencies :: [PkgName]
     , liUnitType :: UnitType
+    }
+
+data LicenseInfo = LicenseInfo
+    { liLicenseId :: License
+    , liLicenseFiles :: [SymbolicPath PackageDir LicenseFile]
+    , liDescription :: String
     }
 
 data DependencyLicenses = DependencyLicenses
@@ -122,80 +126,79 @@ data DependencyLicenses = DependencyLicenses
     , indirectDependencyLicenses :: [LicenseReportInfo]
     }
 
-getLicenses :: PlanJson -> UnitId -> IO DependencyLicenses
-getLicenses plan uid0 = do
+-- Relies on lazy Map to not parse all packages.
+getIndexPackageDescriptions :: IO (Map PkgId GenericPackageDescription)
+getIndexPackageDescriptions = do
     -- find and read ~/.cabal/config
     cfg <- readConfig
     indexPath <- maybe (fail "No hackage.haskell.org repository") return $ cfgRepoIndex cfg hackageHaskellOrg
+    packageTexts <- Map.map BSL.toStrict . Map.fromList <$> readHackageIndex indexPath
+    forM packageTexts $ maybe (fail "parseGenericPackageDescriptionMaybe") pure . parseGenericPackageDescriptionMaybe
 
-    let pidsOfInterest = Set.fromList (map uPId (Map.elems $ pjUnits plan))
-
-    indexDb <- Map.fromList . filter (flip Set.member pidsOfInterest . fst) <$> readHackageIndex indexPath
-
-    let -- generally, units belonging to the same package as 'root'
-        rootPkgUnits = [ u | u@(Unit { uPId = PkgId pn' _ }) <- Map.elems (pjUnits plan), pn' == pn0 ]
-        rootPkgUnitIds = Set.fromList (map uId rootPkgUnits)
-
-        -- the component of interest
-        Just root@Unit { uPId = PkgId pn0 _ } = Map.lookup uid0 (pjUnits plan)
-
-        fwdDeps = planJsonIdGraph' plan
-        revDeps = invertMap fwdDeps
-
-        transUids = transDeps fwdDeps (uId root) Set.\\ rootPkgUnitIds
-        indirectDeps = Set.fromList [ u | u <- Set.toList transUids, Set.null (Map.findWithDefault mempty u revDeps `Set.intersection` rootPkgUnitIds) ]
-        directDeps = transUids Set.\\ indirectDeps
-
-    let getLicenseReportInfo :: UnitId -> Maybe LicenseReportInfo
-        getLicenseReportInfo uid =
-          let Just u = Map.lookup uid (pjUnits plan)
-
-              PkgId (PkgName pn) pv = uPId u
-              url = "http://hackage.haskell.org/package/" <> dispPkgId (uPId u)
-
-              usedBy = Set.fromList [ uPId (Map.findWithDefault undefined unit (pjUnits plan))
-                                    | unit <- Set.toList (Map.findWithDefault mempty uid revDeps)
-                                    , unit `Set.member` (directDeps <> indirectDeps)
-                                    ]
-              revDepIds = [ z | PkgId z _ <- Set.toList usedBy,  z /= pn0 ]
-          in
-          case BSL.toStrict <$> Map.lookup (uPId u) indexDb of
-            Nothing
-              | PkgId (PkgName "rts") _ <- uPId u -> Nothing -- | rts is part of GHC
-              | otherwise -> Just $ LicenseReportInfo
-                             { liName = pn
-                             , liVersion = pv
-                             , liPackageUrl = url
-                             , liLicenseId = Nothing
-                             , liLicenseFiles = Nothing
-                             , liDescription = Nothing
-                             , liReverseDependencies = revDepIds
-                             , liUnitType = uType u
-                             }
-
-            Just packageText ->
-              let gpd = maybe (error "parseGenericPackageDescriptionMaybe") id $ parseGenericPackageDescriptionMaybe packageText
-                  desc = escapeDesc
+genericPackageDescriptionLicenseInfo :: GenericPackageDescription -> LicenseInfo
+genericPackageDescriptionLicenseInfo gpd = LicenseInfo
+    { liLicenseId = lic
+    , liLicenseFiles = lfs
+    , liDescription = desc
+    }
+  where
+    desc = escapeDesc
 #if MIN_VERSION_Cabal(3,2,0)
-                       $ fromShortText
+        $ fromShortText
 #endif
-                       $ synopsis $ packageDescription gpd
-                  lic  = license  $ packageDescription gpd
-                  lfs  = licenseFiles $ packageDescription gpd
-              in
-                Just $ LicenseReportInfo
-                        { liName = pn
-                        , liVersion = pv
-                        , liPackageUrl = url
-                        , liLicenseId = Just lic
-                        , liLicenseFiles = Just lfs
-                        , liDescription = Just desc
-                        , liReverseDependencies = revDepIds
-                        , liUnitType = uType u
-                        }
-    let direct = mapMaybe getLicenseReportInfo $ Set.toList directDeps
-    let indirect = mapMaybe getLicenseReportInfo $ Set.toList indirectDeps
-    pure $ DependencyLicenses direct indirect
+        $ synopsis $ packageDescription gpd
+    lic  = license  $ packageDescription gpd
+    lfs  = licenseFiles $ packageDescription gpd
+
+getLicenseInfo :: Map PkgId GenericPackageDescription -> PkgId -> Maybe LicenseInfo
+getLicenseInfo pkgDescDb pkgId =
+    maybe Nothing (Just . genericPackageDescriptionLicenseInfo) $ Map.lookup pkgId pkgDescDb
+
+-- Assumes that uid0 is mapped by pkgDescDb
+-- Includes "rts" in its output, including a non-existent hackage url.
+-- https://gitlab.haskell.org/ghc/ghc/-/raw/master/LICENSE
+getLicenses :: Map PkgId GenericPackageDescription -> PlanJson -> UnitId -> DependencyLicenses
+getLicenses pkgDescDb plan uid0 = DependencyLicenses direct indirect
+  where
+    -- generally, units belonging to the same package as 'root'
+    rootPkgUnits = [ u | u@(Unit { uPId = PkgId pn' _ }) <- Map.elems (pjUnits plan), pn' == pn0 ]
+    rootPkgUnitIds = Set.fromList (map uId rootPkgUnits)
+
+    -- the component of interest
+    Just root@Unit { uPId = PkgId pn0 _ } = Map.lookup uid0 (pjUnits plan)
+
+    fwdDeps = planJsonIdGraph' plan
+    revDeps = invertMap fwdDeps
+
+    transUids = transDeps fwdDeps (uId root) Set.\\ rootPkgUnitIds
+    -- immediate reverse dependencies don't include any root units, therefore indirect
+    indirectDeps = Set.fromList [ u | u <- Set.toList transUids, Set.null (Map.findWithDefault mempty u revDeps `Set.intersection` rootPkgUnitIds) ]
+    -- transitive and not indirect dependency, therefore direct dependency
+    directDeps =  transUids Set.\\ indirectDeps
+
+    getLicenseReportInfo :: UnitId -> LicenseReportInfo
+    getLicenseReportInfo uid =
+      let Just u = Map.lookup uid (pjUnits plan)
+          PkgId (PkgName pn) pv = uPId u
+          url = case pn of
+              "rts" -> "https://gitlab.haskell.org/ghc/ghc/"
+              _ -> "http://hackage.haskell.org/package/" <> dispPkgId (uPId u)
+
+          usedBy = Set.fromList [ uPId (Map.findWithDefault undefined unit (pjUnits plan))
+                                | unit <- Set.toList (Map.findWithDefault mempty uid revDeps)
+                                , unit `Set.member` (directDeps <> indirectDeps)
+                                ]
+          revDepIds = [ z | PkgId z _ <- Set.toList usedBy,  z /= pn0 ]
+      in LicenseReportInfo
+          { liName = pn
+          , liVersion = pv
+          , liPackageUrl = url
+          , liLicenseInfo = getLicenseInfo pkgDescDb (uPId u)
+          , liReverseDependencies = revDepIds
+          , liUnitType = uType u
+          }
+    direct = map getLicenseReportInfo $ Set.toList directDeps
+    indirect = map getLicenseReportInfo $ Set.toList indirectDeps
 
 -- TODO: emit report to Text or Text builder
 generateLicenseReport :: Maybe FilePath -> PlanJson -> UnitId -> CompName -> IO ()
